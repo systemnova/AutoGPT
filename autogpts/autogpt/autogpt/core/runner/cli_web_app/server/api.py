@@ -1,5 +1,4 @@
 import logging
-from pathlib import Path
 
 from agent_protocol import StepHandler, StepResult
 
@@ -79,10 +78,10 @@ async def interaction_step(
 
 def bootstrap_agent(task, continuous_mode) -> Agent:
     config = ConfigBuilder.build_config_from_env()
-    config.debug_mode = True
+    config.logging.level = logging.DEBUG
+    config.logging.plain_console_output = True
     config.continuous_mode = continuous_mode
     config.temperature = 0
-    config.plain_output = True
     command_registry = CommandRegistry.with_command_modules(COMMAND_CATEGORIES, config)
     config.memory_backend = "no_memory"
     ai_profile = AIProfile(
@@ -90,9 +89,11 @@ def bootstrap_agent(task, continuous_mode) -> Agent:
         ai_role="a multi-purpose AI assistant.",
         ai_goals=[task],
     )
+    # FIXME this won't work - ai_profile and triggering_prompt is not a valid argument,
+    # lacks file_storage, settings and llm_provider
     return Agent(
         command_registry=command_registry,
         ai_profile=ai_profile,
-        config=config,
+        legacy_config=config,
         triggering_prompt=DEFAULT_TRIGGERING_PROMPT,
     )

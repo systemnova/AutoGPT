@@ -1,7 +1,11 @@
-"""The application entry point.  Can be invoked by a CLI or any other front end application."""
+"""
+The application entry point. Can be invoked by a CLI or any other front end application.
+"""
+
 import enum
 import logging
 import math
+import os
 import re
 import signal
 import sys
@@ -11,7 +15,6 @@ from typing import TYPE_CHECKING, Optional
 
 from colorama import Fore, Style
 from forge.sdk.db import AgentDB
-from pydantic import SecretStr
 
 if TYPE_CHECKING:
     from autogpt.agents.agent import Agent
@@ -21,6 +24,7 @@ from autogpt.agent_factory.profile_generator import generate_agent_profile_for_t
 from autogpt.agent_manager import AgentManager
 from autogpt.agents import AgentThoughts, CommandArgs, CommandName
 from autogpt.agents.utils.exceptions import AgentTerminated, InvalidAgentResponseError
+from autogpt.commands.system import finish
 from autogpt.config import (
     AIDirectives,
     AIProfile,
@@ -28,11 +32,12 @@ from autogpt.config import (
     ConfigBuilder,
     assert_config_has_openai_api_key,
 )
-from autogpt.core.resource.model_providers import ModelProviderCredentials
 from autogpt.core.resource.model_providers.openai import OpenAIProvider
 from autogpt.core.runner.client_lib.utils import coroutine
+from autogpt.file_storage import FileStorageBackendName, get_storage
 from autogpt.logs.config import configure_chat_plugins, configure_logging
 from autogpt.logs.helpers import print_attribute, speak
+from autogpt.models.action_history import ActionInterruptedByHuman
 from autogpt.plugins import scan_plugins
 from scripts.install_plugin_deps import install_plugin_dependencies
 
@@ -51,29 +56,39 @@ from .utils import (
 
 @coroutine
 async def run_auto_gpt(
-    continuous: bool,
-    continuous_limit: int,
-    ai_settings: Optional[Path],
-    prompt_settings: Optional[Path],
-    skip_reprompt: bool,
-    speak: bool,
-    debug: bool,
-    gpt3only: bool,
-    gpt4only: bool,
-    memory_type: str,
-    browser_name: str,
-    allow_downloads: bool,
-    skip_news: bool,
-    workspace_directory: Path,
-    install_plugin_deps: bool,
-    override_ai_name: str = "",
-    override_ai_role: str = "",
+    continuous: bool = False,
+    continuous_limit: Optional[int] = None,
+    ai_settings: Optional[Path] = None,
+    prompt_settings: Optional[Path] = None,
+    skip_reprompt: bool = False,
+    speak: bool = False,
+    debug: bool = False,
+    log_level: Optional[str] = None,
+    log_format: Optional[str] = None,
+    log_file_format: Optional[str] = None,
+    gpt3only: bool = False,
+    gpt4only: bool = False,
+    browser_name: Optional[str] = None,
+    allow_downloads: bool = False,
+    skip_news: bool = False,
+    workspace_directory: Optional[Path] = None,
+    install_plugin_deps: bool = False,
+    override_ai_name: Optional[str] = None,
+    override_ai_role: Optional[str] = None,
     resources: Optional[list[str]] = None,
     constraints: Optional[list[str]] = None,
     best_practices: Optional[list[str]] = None,
     override_directives: bool = False,
 ):
+    # Set up configuration
     config = ConfigBuilder.build_config_from_env()
+    # Storage
+    local = config.file_storage_backend == FileStorageBackendName.LOCAL
+    restrict_to_root = not local or config.restrict_to_workspace
+    file_storage = get_storage(
+        config.file_storage_backend, root_path="data", restrict_to_root=restrict_to_root
+    )
+    file_storage.initialize()
 
     # TODO: fill in llm values here
     assert_config_has_openai_api_key(config)
@@ -87,9 +102,11 @@ async def run_auto_gpt(
         skip_reprompt=skip_reprompt,
         speak=speak,
         debug=debug,
+        log_level=log_level,
+        log_format=log_format,
+        log_file_format=log_file_format,
         gpt3only=gpt3only,
         gpt4only=gpt4only,
-        memory_type=memory_type,
         browser_name=browser_name,
         allow_downloads=allow_downloads,
         skip_news=skip_news,
@@ -97,8 +114,7 @@ async def run_auto_gpt(
 
     # Set up logging module
     configure_logging(
-        debug_mode=debug,
-        plain_output=config.plain_output,
+        **config.logging.dict(),
         tts_config=config.tts_config,
     )
 
@@ -108,7 +124,7 @@ async def run_auto_gpt(
 
     if config.continuous_mode:
         for line in get_legal_warning().split("\n"):
-            logger.warn(
+            logger.warning(
                 extra={
                     "title": "LEGAL:",
                     "title_color": Fore.RED,
@@ -121,15 +137,30 @@ async def run_auto_gpt(
         print_motd(config, logger)
         print_git_branch_info(logger)
         print_python_version_info(logger)
+        print_attribute("Smart LLM", config.smart_llm)
+        print_attribute("Fast LLM", config.fast_llm)
+        print_attribute("Browser", config.selenium_web_browser)
+        if config.continuous_mode:
+            print_attribute("Continuous Mode", "ENABLED", title_color=Fore.YELLOW)
+            if continuous_limit:
+                print_attribute("Continuous Limit", config.continuous_limit)
+        if config.tts_config.speak_mode:
+            print_attribute("Speak Mode", "ENABLED")
+        if ai_settings:
+            print_attribute("Using AI Settings File", ai_settings)
+        if prompt_settings:
+            print_attribute("Using Prompt Settings File", prompt_settings)
+        if config.allow_downloads:
+            print_attribute("Native Downloading", "ENABLED")
 
     if install_plugin_deps:
         install_plugin_dependencies()
 
-    config.plugins = scan_plugins(config, config.debug_mode)
+    config.plugins = scan_plugins(config)
     configure_chat_plugins(config)
 
     # Let user choose an existing agent to run
-    agent_manager = AgentManager(config.app_data_dir)
+    agent_manager = AgentManager(file_storage)
     existing_agents = agent_manager.list_agents()
     load_existing_agent = ""
     if existing_agents:
@@ -139,12 +170,18 @@ async def run_auto_gpt(
         )
         load_existing_agent = await clean_input(
             config,
-            "Enter the number or name of the agent to run, or hit enter to create a new one:",
+            "Enter the number or name of the agent to run,"
+            " or hit enter to create a new one:",
         )
         if re.match(r"^\d+$", load_existing_agent):
             load_existing_agent = existing_agents[int(load_existing_agent) - 1]
         elif load_existing_agent and load_existing_agent not in existing_agents:
-            raise ValueError(f"Unknown agent '{load_existing_agent}'")
+            logger.info(
+                f"Unknown agent '{load_existing_agent}', "
+                f"creating a new one instead.",
+                extra={"color": Fore.YELLOW},
+            )
+            load_existing_agent = ""
 
     # Either load existing or set up new agent state
     agent = None
@@ -154,21 +191,20 @@ async def run_auto_gpt(
     # Resume an Existing Agent #
     ############################
     if load_existing_agent:
-        agent_state = agent_manager.retrieve_state(load_existing_agent)
+        agent_state = None
         while True:
             answer = await clean_input(config, "Resume? [Y/n]")
-            if answer.lower() == "y":
+            if answer == "" or answer.lower() == "y":
+                agent_state = agent_manager.load_agent_state(load_existing_agent)
                 break
             elif answer.lower() == "n":
-                agent_state = None
                 break
-            else:
-                print("Please respond with 'y' or 'n'")
 
     if agent_state:
         agent = configure_agent_with_state(
             state=agent_state,
             app_config=config,
+            file_storage=file_storage,
             llm_provider=llm_provider,
         )
         apply_overrides_to_ai_settings(
@@ -181,6 +217,21 @@ async def run_auto_gpt(
             best_practices=best_practices,
             replace_directives=override_directives,
         )
+
+        if (
+            agent.event_history.current_episode
+            and agent.event_history.current_episode.action.name == finish.__name__
+            and not agent.event_history.current_episode.result
+        ):
+            # Agent was resumed after `finish` -> rewrite result of `finish` action
+            finish_reason = agent.event_history.current_episode.action.args["reason"]
+            print(f"Agent previously self-terminated; reason: '{finish_reason}'")
+            new_assignment = await clean_input(
+                config, "Please give a follow-up question or assignment:"
+            )
+            agent.event_history.register_result(
+                ActionInterruptedByHuman(feedback=new_assignment)
+            )
 
         # If any of these are specified as arguments,
         #  assume the user doesn't want to revise them
@@ -205,11 +256,14 @@ async def run_auto_gpt(
     # Set up a new Agent #
     ######################
     if not agent:
-        task = await clean_input(
-            config,
-            "Enter the task that you want AutoGPT to execute,"
-            " with as much detail as possible:",
-        )
+        task = ""
+        while task.strip() == "":
+            task = await clean_input(
+                config,
+                "Enter the task that you want AutoGPT to execute,"
+                " with as much detail as possible:",
+            )
+
         base_ai_directives = AIDirectives.from_file(config.prompt_settings_file)
 
         ai_profile, task_oriented_ai_directives = await generate_agent_profile_for_task(
@@ -249,18 +303,20 @@ async def run_auto_gpt(
             logger.info("AI config overrides specified through CLI; skipping revision")
 
         agent = create_agent(
+            agent_id=agent_manager.generate_id(ai_profile.ai_name),
             task=task,
             ai_profile=ai_profile,
             directives=ai_directives,
             app_config=config,
+            file_storage=file_storage,
             llm_provider=llm_provider,
         )
-        agent.attach_fs(agent_manager.get_agent_dir(agent.state.agent_id))
 
         if not agent.config.allow_fs_access:
             logger.info(
-                f"{Fore.YELLOW}NOTE: All files/directories created by this agent"
-                f" can be found inside its workspace at:{Fore.RESET} {agent.workspace.root}",
+                f"{Fore.YELLOW}"
+                "NOTE: All files/directories created by this agent can be found "
+                f"inside its workspace at:{Fore.RESET} {agent.workspace.root}",
                 extra={"preserve_color": True},
             )
 
@@ -277,35 +333,42 @@ async def run_auto_gpt(
         save_as_id = (
             await clean_input(
                 config,
-                f"Press enter to save as '{agent_id}', or enter a different ID to save to:",
+                f"Press enter to save as '{agent_id}',"
+                " or enter a different ID to save to:",
             )
             or agent_id
         )
         if save_as_id and save_as_id != agent_id:
-            agent.set_id(
-                new_id=save_as_id,
-                new_agent_dir=agent_manager.get_agent_dir(save_as_id),
-            )
-            # TODO: clone workspace if user wants that
-            # TODO: ... OR allow many-to-one relations of agents and workspaces
+            agent.change_agent_id(save_as_id)
+            # TODO: allow many-to-one relations of agents and workspaces
 
-        agent.state.save_to_json_file(agent.file_manager.state_file_path)
+        await agent.save_state()
 
 
 @coroutine
 async def run_auto_gpt_server(
-    prompt_settings: Optional[Path],
-    debug: bool,
-    gpt3only: bool,
-    gpt4only: bool,
-    memory_type: str,
-    browser_name: str,
-    allow_downloads: bool,
-    install_plugin_deps: bool,
+    prompt_settings: Optional[Path] = None,
+    debug: bool = False,
+    log_level: Optional[str] = None,
+    log_format: Optional[str] = None,
+    log_file_format: Optional[str] = None,
+    gpt3only: bool = False,
+    gpt4only: bool = False,
+    browser_name: Optional[str] = None,
+    allow_downloads: bool = False,
+    install_plugin_deps: bool = False,
 ):
     from .agent_protocol_server import AgentProtocolServer
 
     config = ConfigBuilder.build_config_from_env()
+
+    # Storage
+    local = config.file_storage_backend == FileStorageBackendName.LOCAL
+    restrict_to_root = not local or config.restrict_to_workspace
+    file_storage = get_storage(
+        config.file_storage_backend, root_path="data", restrict_to_root=restrict_to_root
+    )
+    file_storage.initialize()
 
     # TODO: fill in llm values here
     assert_config_has_openai_api_key(config)
@@ -314,17 +377,18 @@ async def run_auto_gpt_server(
         config=config,
         prompt_settings_file=prompt_settings,
         debug=debug,
+        log_level=log_level,
+        log_format=log_format,
+        log_file_format=log_file_format,
         gpt3only=gpt3only,
         gpt4only=gpt4only,
-        memory_type=memory_type,
         browser_name=browser_name,
         allow_downloads=allow_downloads,
     )
 
     # Set up logging module
     configure_logging(
-        debug_mode=debug,
-        plain_output=config.plain_output,
+        **config.logging.dict(),
         tts_config=config.tts_config,
     )
 
@@ -333,14 +397,26 @@ async def run_auto_gpt_server(
     if install_plugin_deps:
         install_plugin_dependencies()
 
-    config.plugins = scan_plugins(config, config.debug_mode)
+    config.plugins = scan_plugins(config)
 
     # Set up & start server
-    database = AgentDB("sqlite:///data/ap_server.db", debug_enabled=False)
-    server = AgentProtocolServer(
-        app_config=config, database=database, llm_provider=llm_provider
+    database = AgentDB(
+        database_string=os.getenv("AP_SERVER_DB_URL", "sqlite:///data/ap_server.db"),
+        debug_enabled=debug,
     )
-    await server.start()
+    port: int = int(os.getenv("AP_SERVER_PORT", default=8000))
+    server = AgentProtocolServer(
+        app_config=config,
+        database=database,
+        file_storage=file_storage,
+        llm_provider=llm_provider,
+    )
+    await server.start(port=port)
+
+    logging.getLogger().info(
+        f"Total OpenAI session cost: "
+        f"${round(sum(b.total_cost for b in server._task_budgets.values()), 2)}"
+    )
 
 
 def _configure_openai_provider(config: Config) -> OpenAIProvider:
@@ -352,19 +428,11 @@ def _configure_openai_provider(config: Config) -> OpenAIProvider:
     Returns:
         A configured OpenAIProvider object.
     """
-    if config.openai_api_key is None:
+    if config.openai_credentials is None:
         raise RuntimeError("OpenAI key is not configured")
 
     openai_settings = OpenAIProvider.default_settings.copy(deep=True)
-    openai_settings.credentials = ModelProviderCredentials(
-        api_key=SecretStr(config.openai_api_key),
-        # TODO: support OpenAI Azure credentials
-        api_base=SecretStr(config.openai_api_base) if config.openai_api_base else None,
-        api_type=SecretStr(config.openai_api_type) if config.openai_api_type else None,
-        api_version=SecretStr(config.openai_api_version)
-        if config.openai_api_version
-        else None,
-    )
+    openai_settings.credentials = config.openai_credentials
     return OpenAIProvider(
         settings=openai_settings,
         logger=logging.getLogger("OpenAIProvider"),
@@ -410,7 +478,9 @@ async def run_interaction_loop(
     cycle_budget = cycles_remaining = _get_cycle_budget(
         legacy_config.continuous_mode, legacy_config.continuous_limit
     )
-    spinner = Spinner("Thinking...", plain_output=legacy_config.plain_output)
+    spinner = Spinner(
+        "Thinking...", plain_output=legacy_config.logging.plain_console_output
+    )
     stop_reason = None
 
     def graceful_agent_interrupt(signum: int, frame: Optional[FrameType]) -> None:
@@ -466,7 +536,7 @@ async def run_interaction_loop(
                     assistant_reply_dict,
                 ) = await agent.propose_action()
             except InvalidAgentResponseError as e:
-                logger.warn(f"The agent's thoughts could not be parsed: {e}")
+                logger.warning(f"The agent's thoughts could not be parsed: {e}")
                 consecutive_failures += 1
                 if consecutive_failures >= 3:
                     logger.error(
@@ -528,7 +598,7 @@ async def run_interaction_loop(
                     extra={"color": Fore.MAGENTA},
                 )
             elif user_feedback == UserFeedback.EXIT:
-                logger.warn("Exiting...")
+                logger.warning("Exiting...")
                 exit()
             else:  # user_feedback == UserFeedback.TEXT
                 command_name = "human_feedback"
@@ -556,14 +626,18 @@ async def run_interaction_loop(
 
         handle_stop_signal()
 
-        result = await agent.execute(command_name, command_args, user_input)
+        if command_name:
+            result = await agent.execute(command_name, command_args, user_input)
 
-        if result.status == "success":
-            logger.info(result, extra={"title": "SYSTEM:", "title_color": Fore.YELLOW})
-        elif result.status == "error":
-            logger.warn(
-                f"Command {command_name} returned an error: {result.error or result.reason}"
-            )
+            if result.status == "success":
+                logger.info(
+                    result, extra={"title": "SYSTEM:", "title_color": Fore.YELLOW}
+                )
+            elif result.status == "error":
+                logger.warning(
+                    f"Command {command_name} returned an error: "
+                    f"{result.error or result.reason}"
+                )
 
 
 def update_user(
@@ -649,13 +723,13 @@ async def get_user_feedback(
         if console_input.lower().strip() == config.authorise_key:
             user_feedback = UserFeedback.AUTHORIZE
         elif console_input.lower().strip() == "":
-            logger.warn("Invalid input format.")
+            logger.warning("Invalid input format.")
         elif console_input.lower().startswith(f"{config.authorise_key} -"):
             try:
                 user_feedback = UserFeedback.AUTHORIZE
                 new_cycles_remaining = abs(int(console_input.split(" ")[1]))
             except ValueError:
-                logger.warn(
+                logger.warning(
                     f"Invalid input format. "
                     f"Please enter '{config.authorise_key} -N'"
                     " where N is the number of continuous tasks."
@@ -689,7 +763,7 @@ def print_assistant_thoughts(
         )
         assistant_thoughts_plan = remove_ansi_escape(assistant_thoughts.get("plan", ""))
         assistant_thoughts_criticism = remove_ansi_escape(
-            assistant_thoughts.get("criticism", "")
+            assistant_thoughts.get("self_criticism", "")
         )
         assistant_thoughts_speak = remove_ansi_escape(
             assistant_thoughts.get("speak", "")

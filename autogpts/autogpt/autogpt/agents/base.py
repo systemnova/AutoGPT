@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from auto_gpt_plugin_template import AutoGPTPluginTemplate
@@ -12,6 +11,7 @@ if TYPE_CHECKING:
     from autogpt.config import Config
     from autogpt.core.prompting.base import PromptStrategy
     from autogpt.core.resource.model_providers.schema import (
+        AssistantChatMessage,
         ChatModelInfo,
         ChatModelProvider,
         ChatModelResponse,
@@ -38,11 +38,10 @@ from autogpt.core.resource.model_providers.openai import (
     OpenAIModelName,
 )
 from autogpt.core.runner.client_lib.logging.helpers import dump_prompt
+from autogpt.file_storage.base import FileStorage
 from autogpt.llm.providers.openai import get_openai_command_specs
 from autogpt.models.action_history import ActionResult, EpisodicActionHistory
 from autogpt.prompts.prompt import DEFAULT_TRIGGERING_PROMPT
-
-from .utils.agent_file_manager import AgentFileManager
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +60,7 @@ class BaseAgentConfiguration(SystemConfiguration):
     default_cycle_instruction: str = DEFAULT_TRIGGERING_PROMPT
     """The default instruction passed to the AI for a thinking cycle."""
 
-    big_brain: bool = UserConfigurable(default=False)
+    big_brain: bool = UserConfigurable(default=True)
     """
     Whether this agent uses the configured smart LLM (default) to think,
     as opposed to the configured fast LLM. Enabling this disables hybrid mode.
@@ -124,8 +123,7 @@ class BaseAgentConfiguration(SystemConfiguration):
 
 
 class BaseAgentSettings(SystemSettings):
-    agent_id: Optional[str] = None
-    agent_data_dir: Optional[Path] = None
+    agent_id: str = ""
 
     ai_profile: AIProfile = Field(default_factory=lambda: AIProfile(ai_name="AutoGPT"))
     """The AI profile or "personality" of the agent."""
@@ -146,14 +144,6 @@ class BaseAgentSettings(SystemSettings):
     history: EpisodicActionHistory = Field(default_factory=EpisodicActionHistory)
     """(STATE) The action history of the agent."""
 
-    def save_to_json_file(self, file_path: Path) -> None:
-        with file_path.open("w") as f:
-            f.write(self.json())
-
-    @classmethod
-    def load_from_json_file(cls, file_path: Path):
-        return cls.parse_file(file_path)
-
 
 class BaseAgent(Configurable[BaseAgentSettings], ABC):
     """Base class for all AutoGPT agent classes."""
@@ -171,6 +161,7 @@ class BaseAgent(Configurable[BaseAgentSettings], ABC):
         llm_provider: ChatModelProvider,
         prompt_strategy: PromptStrategy,
         command_registry: CommandRegistry,
+        file_storage: FileStorage,
         legacy_config: Config,
     ):
         self.state = settings
@@ -181,12 +172,6 @@ class BaseAgent(Configurable[BaseAgentSettings], ABC):
 
         self.legacy_config = legacy_config
         """LEGACY: Monolithic application configuration."""
-
-        self.file_manager: AgentFileManager = (
-            AgentFileManager(settings.agent_data_dir)
-            if settings.agent_data_dir
-            else None
-        )  # type: ignore
 
         self.llm_provider = llm_provider
 
@@ -202,21 +187,6 @@ class BaseAgent(Configurable[BaseAgentSettings], ABC):
 
         logger.debug(f"Created {__class__} '{self.ai_profile.ai_name}'")
 
-    def set_id(self, new_id: str, new_agent_dir: Optional[Path] = None):
-        self.state.agent_id = new_id
-        if self.state.agent_data_dir:
-            if not new_agent_dir:
-                raise ValueError(
-                    "new_agent_dir must be specified if one is currently configured"
-                )
-            self.attach_fs(new_agent_dir)
-
-    def attach_fs(self, agent_dir: Path) -> AgentFileManager:
-        self.file_manager = AgentFileManager(agent_dir)
-        self.file_manager.initialize()
-        self.state.agent_data_dir = agent_dir
-        return self.file_manager
-
     @property
     def llm(self) -> ChatModelInfo:
         """The LLM that the agent uses to think."""
@@ -230,18 +200,11 @@ class BaseAgent(Configurable[BaseAgentSettings], ABC):
         return self.config.send_token_limit or self.llm.max_tokens * 3 // 4
 
     async def propose_action(self) -> ThoughtProcessOutput:
-        """Runs the agent for one cycle.
-
-        Params:
-            instruction: The instruction to put at the end of the prompt.
+        """Proposes the next action to execute, based on the task and current state.
 
         Returns:
             The command name and arguments, if any, and the agent's thoughts.
         """
-        assert self.file_manager, (
-            f"Agent has no FileManager: call {__class__.__name__}.attach_fs()"
-            " before trying to run the agent."
-        )
 
         # Scratchpad as surrogate PromptGenerator for plugin hooks
         self._prompt_scratchpad = PromptScratchpad()
@@ -250,7 +213,7 @@ class BaseAgent(Configurable[BaseAgentSettings], ABC):
         prompt = self.on_before_think(prompt, scratchpad=self._prompt_scratchpad)
 
         logger.debug(f"Executing prompt:\n{dump_prompt(prompt)}")
-        raw_response = await self.llm_provider.create_chat_completion(
+        response = await self.llm_provider.create_chat_completion(
             prompt.messages,
             functions=get_openai_command_specs(
                 self.command_registry.list_available_commands(self)
@@ -259,11 +222,16 @@ class BaseAgent(Configurable[BaseAgentSettings], ABC):
             if self.config.use_functions_api
             else [],
             model_name=self.llm.name,
+            completion_parser=lambda r: self.parse_and_process_response(
+                r,
+                prompt,
+                scratchpad=self._prompt_scratchpad,
+            ),
         )
         self.config.cycle_count += 1
 
         return self.on_response(
-            llm_response=raw_response,
+            llm_response=response,
             prompt=prompt,
             scratchpad=self._prompt_scratchpad,
         )
@@ -283,7 +251,7 @@ class BaseAgent(Configurable[BaseAgentSettings], ABC):
             user_input: The user's input, if any.
 
         Returns:
-            The results of the command.
+            ActionResult: An object representing the result(s) of the command.
         """
         ...
 
@@ -294,13 +262,13 @@ class BaseAgent(Configurable[BaseAgentSettings], ABC):
         extra_messages: Optional[list[ChatMessage]] = None,
         **extras,
     ) -> ChatPrompt:
-        """Constructs and returns a prompt with the following structure:
-        1. System prompt
-        2. Message history of the agent, truncated & prepended with running summary as needed
-        3. `cycle_instruction`
+        """Constructs a prompt using `self.prompt_strategy`.
 
         Params:
-            cycle_instruction: The final instruction for a thinking cycle
+            scratchpad: An object for plugins to write additional prompt elements to.
+                (E.g. commands, constraints, best practices)
+            extra_commands: Additional commands that the agent has access to.
+            extra_messages: Additional messages to include in the prompt.
         """
         if not extra_commands:
             extra_commands = []
@@ -349,7 +317,9 @@ class BaseAgent(Configurable[BaseAgentSettings], ABC):
         output to the prompt.
 
         Params:
-            instruction: The instruction for the current cycle, also used in constructing the prompt
+            prompt: The prompt that is about to be executed.
+            scratchpad: An object for plugins to write additional prompt elements to.
+                (E.g. commands, constraints, best practices)
 
         Returns:
             The prompt to execute
@@ -386,30 +356,26 @@ class BaseAgent(Configurable[BaseAgentSettings], ABC):
     ) -> ThoughtProcessOutput:
         """Called upon receiving a response from the chat model.
 
-        Adds the last/newest message in the prompt and the response to `history`,
-        and calls `self.parse_and_process_response()` to do the rest.
+        Calls `self.parse_and_process_response()`.
 
         Params:
-            llm_response: The raw response from the chat model
-            prompt: The prompt that was executed
-            instruction: The instruction for the current cycle, also used in constructing the prompt
+            llm_response: The raw response from the chat model.
+            prompt: The prompt that was executed.
+            scratchpad: An object containing additional prompt elements from plugins.
+                (E.g. commands, constraints, best practices)
 
         Returns:
             The parsed command name and command args, if any, and the agent thoughts.
         """
 
-        return self.parse_and_process_response(
-            llm_response,
-            prompt,
-            scratchpad=scratchpad,
-        )
+        return llm_response.parsed_result
 
         # TODO: update memory/context
 
     @abstractmethod
     def parse_and_process_response(
         self,
-        llm_response: ChatModelResponse,
+        llm_response: AssistantChatMessage,
         prompt: ChatPrompt,
         scratchpad: PromptScratchpad,
     ) -> ThoughtProcessOutput:
@@ -419,9 +385,10 @@ class BaseAgent(Configurable[BaseAgentSettings], ABC):
         since the implementation depends on the role of the derivative Agent.
 
         Params:
-            llm_response: The raw response from the chat model
-            prompt: The prompt that was executed
-            instruction: The instruction for the current cycle, also used in constructing the prompt
+            llm_response: The raw response from the chat model.
+            prompt: The prompt that was executed.
+            scratchpad: An object containing additional prompt elements from plugins.
+                (E.g. commands, constraints, best practices)
 
         Returns:
             The parsed command name and command args, if any, and the agent thoughts.
